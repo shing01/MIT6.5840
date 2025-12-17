@@ -23,6 +23,18 @@ type ExampleReply struct {
 }
 
 // Add your RPC definitions here.
+// 请求结构体
+type AskTaskArgs struct {
+	// WorkerId int
+}
+
+// 回复结构体
+type AskTaskReply struct {
+	TaskType string // "Map" "Reduce" "Wait" "Exit"
+	TaskId int
+	Filename string // 如果是Map任务，这里是文件名
+	NReduce int 	// 总共有多少个Reduce任务
+}
 
 
 // Cook up a unique-ish UNIX-domain socket name
