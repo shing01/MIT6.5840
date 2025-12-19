@@ -5,6 +5,10 @@ import "log"
 import "net/rpc"
 import "hash/fnv"
 import "time"
+import "encoding/json"
+import "os"
+import "io/ioutil"
+import "sort"
 
 
 //
@@ -25,6 +29,111 @@ func ihash(key string) int {
 	return int(h.Sum32() & 0x7fffffff)
 }
 
+func doMap(mapf func(string, string) []KeyValue, filename string, mapId int, nReduce int) {
+	// 1. read files
+	file, err := os.Open(filename)
+	if err != nil {
+		log.Fatalf("cannot open %v", filename)
+	}
+	content, err := ioutil.ReadAll(file)
+	if err != nil {
+		log.Fatalf("cannot read %v", filename)
+	}
+	file.Close()
+
+	// 2. call mapf(plugin) to get key-value pairs
+	kva := mapf(filename, string(content))
+
+	// 3. nReduce buffers
+	hashedKV := make([][]KeyValue, nReduce)
+	for i := 0; i < nReduce; i++ {
+		hashedKV[i] = []KeyValue{}
+	}
+
+	// 4. partitioning
+	for _, kv := range kva {
+		bucketId := ihash(kv.Key) % nReduce
+		hashedKV[bucketId] = append(hashedKV[bucketId], kv)
+	}
+
+	// 5. write files
+	for i := 0; i < nReduce; i++ {
+		outputFilename := fmt.Sprintf("mr-%d-%d", mapId, i)
+
+		outFile, _ := os.Create(outputFilename)
+
+		// write by json
+		enc := json.NewEncoder(outFile)
+		for _, kv := range hashedKV[i] {
+			enc.Encode(&kv)
+		}
+		outFile.Close()
+	}
+}
+
+func doReduce(reducef func(string, []string) string, reduceId int, nMap int) {
+	// read all intermediate files
+	// file format: mr-X-Y --> X: MapId Y: current reduceId
+	var intermediate []KeyValue
+
+	for i := 0; i < nMap; i++ {
+		filename := fmt.Sprintf("mr-%d-%d", i, reduceId)
+		file, err := os.Open(filename)
+		if err != nil {
+			continue
+		}
+
+		dec := json.NewDecoder(file)
+		for {
+			var kv KeyValue
+			if err := dec.Decode(&kv); err != nil {
+				break
+			}
+			intermediate = append(intermediate, kv)
+		}
+		file.Close()
+	}
+
+	// sort --> combine all the same Key
+	sort.Slice(intermediate, func(i, j int) bool {
+		return intermediate[i].Key < intermediate[j].Key
+	})
+
+	// create output files mr-out-Y
+	oname := fmt.Sprintf("mr-out-%d", reduceId)
+	ofile, _ := os.Create(oname)
+
+	// call Reduce on each distinct key in intermediate[]
+	// and print the result to mr-out-Y
+	i := 0
+	for i < len(intermediate) {
+		j := i + 1
+		for j < len(intermediate) && intermediate[j].Key == intermediate[i].Key {
+			j++
+		}
+		values := []string{}
+		for k := i; k < j; k++ {
+			values = append(values, intermediate[k].Value)
+		}
+		output := reducef(intermediate[i].Key, values)
+
+		// Reduce output
+		fmt.Fprintf(ofile, "%v %v\n", intermediate[i].Key, output)
+
+		i = j
+	}
+
+	ofile.Close()
+}
+
+func CallReportTask(taskType string, taskId int) {
+	args := ReportTaskArgs {
+		TaskType: taskType,
+		TaskId:   taskId,
+	}
+	reply := ReportTaskReply{}
+	call("Coordinator.ReportTask", &args, &reply)
+}
 
 //
 // main/mrworker.go calls this function.
@@ -39,18 +148,28 @@ func Worker(mapf func(string, string) []KeyValue,
 		ok := call("Coordinator.AskTask", &args, &reply)
 
 		if !ok {
-			fmt.Println("Worker: 联系不上 Coordinator")
+			fmt.Println("Worker: cannot contact Coordinator")
 			return
 		}
 
 		switch reply.TaskType {
 		case "Map":
-			fmt.Printf("Worker: 拿到 Map 任务 %d, 处理文件 %s\n", reply.TaskId, reply.Filename)
-			time.Sleep(time.Second)
+			fmt.Printf("Worker: get Map task %d, process file %s\n", reply.TaskId, reply.Filename)
+			doMap(mapf, reply.Filename, reply.TaskId, reply.NReduce)
+			CallReportTask("Map", reply.TaskId)
 		
+		case "Reduce":
+			fmt.Printf("Worker: get Reduce task %d\n", reply.TaskId)
+			doReduce(reducef, reply.TaskId, reply.NMap)
+			CallReportTask("Reduce", reply.TaskId)
+
 		case "Wait":
-			fmt.Println("Worker: 等待分配任务")
+			fmt.Println("Worker: waiting for task")
 			time.Sleep(time.Second)
+
+		case "Exit":
+			fmt.Println("Worker: all tasks are completed")
+			return
 
 		default:
 			time.Sleep(time.Second)

@@ -5,30 +5,31 @@ import "net"
 import "os"
 import "net/rpc"
 import "net/http"
-// import "fmt"
+import "fmt"
 import "sync"
 import "time"
 
 const (
-	TaskStatusIdle       = 0 // 任务闲置
-	TaskStatusInProgress = 1 // 任务进行中
-	TaskStatusCompleted  = 2 // 任务完成
+	TaskStatusIdle       = 0
+	TaskStatusInProgress = 1
+	TaskStatusCompleted  = 2
 )
 
 type Task struct {
 	Type      string   // "Map" "Reduce"
 	Status    int	   // "Idle" "InProgress" "Completed"
-	Index     int	   // 任务编号: Map任务对应文件下标, Reduce任务对应哈希桶编号
+	Index     int	   // Map task --> file index, Reduce task --> hash bucket number
 	Filename  string
 	StartTime time.Time
 }
 
 type Coordinator struct {
 	// Your definitions here.
-	files     []string
-	nReduce   int
-	mapTasks  []Task
-	mu        sync.Mutex
+	files       []string
+	nReduce     int
+	mapTasks    []Task
+	reduceTasks []Task
+	mu          sync.Mutex
 
 }
 
@@ -66,33 +67,97 @@ func (c *Coordinator) server() {
 // if the entire job has finished.
 //
 func (c *Coordinator) Done() bool {
-	ret := false
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ret := true
 
 	// Your code here.
+	for _, task := range c.mapTasks {
+		if task.Status != TaskStatusCompleted {
+			ret = false
+			return ret
+		}
+	}
 
+	for _, task := range c.reduceTasks {
+		if task.Status != TaskStatusCompleted {
+			ret = false
+			return ret
+		}
+	}
 
 	return ret
 }
 
-// RPC Handler: 处理Worker的请求
+// RPC Handler
 func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
 
+	mapDone := true 
 	for i, task := range c.mapTasks {
-		if task.Status == TaskStatusIdle {
-			c.mapTasks[i].Status = TaskStatusInProgress
-			c.mapTasks[i].StartTime = time.Now()
+		// check if all Map tasks are completed
+		if task.Status != TaskStatusCompleted {
+			mapDone = false
+			if task.Status == TaskStatusIdle {
+				c.mapTasks[i].Status = TaskStatusInProgress
+				c.mapTasks[i].StartTime = time.Now()
 
-			reply.TaskType = "Map"
-			reply.TaskId = task.Index
-			reply.Filename = task.Filename
-			reply.NReduce = c.nReduce
+				reply.TaskType = "Map"
+				reply.TaskId = task.Index
+				reply.Filename = task.Filename
+				reply.NReduce = c.nReduce
 
-			return nil
+				return nil
+			}
 		}
 	}
-	reply.TaskType = "Wait"
+
+	// Map tasks not all completed and no Idle tasks
+	if !mapDone {
+		reply.TaskType = "Wait"
+		return nil
+	}
+
+	// mapDone == true --> reduce stage
+	reduceDone := true
+	for i, task := range c.reduceTasks {
+		if task.Status != TaskStatusCompleted {
+			reduceDone = false
+			if task.Status == TaskStatusIdle {
+				c.reduceTasks[i].Status = TaskStatusInProgress
+				c.reduceTasks[i].StartTime = time.Now()
+
+				reply.TaskType = "Reduce"
+				reply.TaskId = task.Index
+				reply.NMap = len(c.files)
+
+				return nil
+			}
+		}
+	}
+
+	if !reduceDone {
+		reply.TaskType = "Wait"
+	} else {
+		reply.TaskType = "Exit"
+	}
+
+	return nil
+}
+
+func (c *Coordinator) ReportTask(args *ReportTaskArgs, reply *ReportTaskReply) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	if args.TaskType == "Map" {
+		c.mapTasks[args.TaskId].Status = TaskStatusCompleted
+		fmt.Printf("Coordinator: Map task %d is completed\n", args.TaskId)
+	} else if args.TaskType == "Reduce" {
+		c.reduceTasks[args.TaskId].Status = TaskStatusCompleted
+		fmt.Printf("Coordinator: Reduce task %d is completed\n", args.TaskId)
+	}
 
 	return nil
 }
@@ -104,13 +169,14 @@ func (c *Coordinator) AskTask(args *AskTaskArgs, reply *AskTaskReply) error {
 //
 func MakeCoordinator(files []string, nReduce int) *Coordinator {
 	c := Coordinator{
-		files:	  files,
-		nReduce:  nReduce,
-		mapTasks: make([]Task, len(files)),
+		files:	     files,
+		nReduce:  	 nReduce,
+		mapTasks: 	 make([]Task, len(files)),
+		reduceTasks: make([]Task, nReduce),
 	}
 
 	// Your code here.
-	// 初始化Map任务
+	// init Map task
 	for i, file := range files {
 		c.mapTasks[i] = Task{
 			Type:     "Map",
@@ -120,7 +186,44 @@ func MakeCoordinator(files []string, nReduce int) *Coordinator {
 		}
 	}
 
+	// init Reduce task
+	for i := 0; i < nReduce; i++ {
+		c.reduceTasks[i] = Task{
+			Type:	 "Reduce",
+			Status:	 TaskStatusIdle,
+			Index:	 i,
+		}
+	}
 
 	c.server()
+
+	// monitor goroutine
+	go func() {
+		for {
+			// check per second
+			time.Sleep(time.Second)
+			c.mu.Lock()
+
+			// check Map task
+			for i := 0; i < len(c.mapTasks); i++ {
+				if c.mapTasks[i].Status == TaskStatusInProgress &&
+					time.Since(c.mapTasks[i].StartTime) > 10*time.Second {
+						c.mapTasks[i].Status = TaskStatusIdle
+						fmt.Printf("Coordinator: Map task %d Timeout, reset\n", i)
+				}
+			}
+
+			// check Reduce task
+			for i := 0; i < len(c.reduceTasks); i++ {
+				if c.reduceTasks[i].Status == TaskStatusInProgress &&
+					time.Since(c.reduceTasks[i].StartTime) > 10*time.Second {
+						c.reduceTasks[i].Status = TaskStatusIdle
+						fmt.Printf("Coordinator: Reduce task %d Timeout, reset\n", i)
+				}
+			}
+			c.mu.Unlock()
+		}
+	}()
+
 	return &c
 }
