@@ -19,6 +19,16 @@ import (
 	"6.5840/tester1"
 )
 
+const (
+	StateFollower  = 0
+	StateCandidate = 1
+	StateLeader	   = 2
+)
+
+const (
+	ElectionTimeoutMin = 150 * time.Millisecond
+	ElectionTimeoutMax = 300 * time.Millisecond
+)
 
 // A Go object implementing a single Raft peer.
 type Raft struct {
@@ -32,6 +42,13 @@ type Raft struct {
 	// Look at the paper's Figure 2 for a description of what
 	// state a Raft server must maintain.
 
+	// Persistent state on all servers
+	currentTerm  int
+	voteFor	 int
+
+	// Volatile state on all servers
+	state		 int
+	lastElection time.Time
 }
 
 // return currentTerm and whether this server
@@ -41,6 +58,14 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (3A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	term = rf.currentTerm
+	if rf.state == StateLeader {
+		isleader = true
+	}
+
 	return term, isleader
 }
 
@@ -105,17 +130,78 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 // field names must start with capital letters!
 type RequestVoteArgs struct {
 	// Your data here (3A, 3B).
+	Term 	    int // candidate's term
+	CandidateId int
 }
 
 // example RequestVote RPC reply structure.
 // field names must start with capital letters!
 type RequestVoteReply struct {
 	// Your data here (3A).
+	Term 		int  // current term, for candidate to update itself
+	VoteGranted bool // if get vote or not
 }
 
 // example RequestVote RPC handler.
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (3A, 3B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	
+	if args.Term < rf.currentTerm {
+		reply.VoteGranted = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.state = StateFollower
+		rf.currentTerm = args.Term
+		rf.voteFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+
+	if rf.voteFor == -1 || rf.voteFor == args.CandidateId {
+		reply.VoteGranted = true
+		rf.voteFor = args.CandidateId
+		rf.lastElection = time.Now()
+	} else {
+		reply.VoteGranted = false
+	}
+}
+
+type AppendEntriesArgs struct {
+	Term	 int // leader's term
+	LeaderId int
+}
+
+type AppendEntriesReply struct {
+	Term	int // current term, for leader to update itself
+	Success bool
+}
+
+// example AppendEntries RPC handler.
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	if args.Term < rf.currentTerm {
+		reply.Success = false
+		reply.Term = rf.currentTerm
+		return
+	}
+
+	if args.Term > rf.currentTerm {
+		rf.voteFor = -1
+		rf.currentTerm = args.Term
+	}
+
+	rf.state = StateFollower
+	rf.lastElection = time.Now()
+
+	reply.Success = true
+	reply.Term = rf.currentTerm
 }
 
 // example code to send a RequestVote RPC to a server.
@@ -150,6 +236,10 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 	return ok
 }
 
+func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
+	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
+	return ok
+}
 
 // the service using Raft (e.g. a k/v server) wants to start
 // agreement on the next command to be appended to Raft's log. if this
@@ -193,17 +283,128 @@ func (rf *Raft) killed() bool {
 	return z == 1
 }
 
+func (rf *Raft) startElection() {
+	rf.mu.Lock()
+
+	rf.state = StateCandidate
+	rf.currentTerm++
+	rf.voteFor = rf.me
+	rf.lastElection = time.Now()
+
+	currentTerm := rf.currentTerm // 保存当前任期，用于后续RPC请求的过期检查
+
+	votes := 1
+	totalPeers := len(rf.peers)
+	majority := totalPeers/2 + 1
+
+	rf.mu.Unlock()
+
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			args := RequestVoteArgs{
+				Term: 		 rf.currentTerm,
+				CandidateId: rf.me,
+			}
+			reply := RequestVoteReply{}
+
+			if ok := rf.sendRequestVote(server, &args, &reply); !ok {
+				return
+			}
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			// 过期检查: 状态已改变或任期已更新
+			if rf.state != StateCandidate || rf.currentTerm != currentTerm {
+				return
+			}
+
+			//Term检查: 发现更高任期
+			if reply.Term > rf.currentTerm {
+				rf.state = StateFollower
+				rf.currentTerm = reply.Term
+				rf.voteFor = -1
+				return
+			}
+
+			if reply.VoteGranted {
+				votes++
+				if votes >= majority && rf.state == StateCandidate {
+					rf.state = StateLeader
+					go rf.sendHeartbeats()
+				}
+			}
+		}(server)
+	}
+}
+
+func (rf *Raft) sendHeartbeats() {
+	rf.mu.Lock()
+
+	if rf.state != StateLeader {
+		rf.mu.Unlock()
+		return
+	}
+
+	currentTerm := rf.currentTerm
+	rf.mu.Unlock()
+
+	for server := range rf.peers {
+		if server == rf.me {
+			continue
+		}
+
+		go func(server int) {
+			rf.mu.Lock()
+
+			args := AppendEntriesArgs{
+				Term: 	  currentTerm,
+				LeaderId: rf.me,
+			}
+
+			rf.mu.Unlock()
+
+			reply := AppendEntriesReply{}
+			ok := rf.sendAppendEntries(server, &args, &reply)
+
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+
+			if rf.state != StateLeader || rf.currentTerm != currentTerm {
+				return
+			}
+
+			if ok && rf.currentTerm < reply.Term {
+				rf.state = StateFollower
+				rf.currentTerm = reply.Term
+				rf.voteFor = -1
+				return
+			}
+		}(server)
+	}
+	time.Sleep(100 * time.Millisecond)
+}
+
 func (rf *Raft) ticker() {
 	for rf.killed() == false {
-
-		// Your code here (3A)
-		// Check if a leader election should be started.
-
-
 		// pause for a random amount of time between 50 and 350
 		// milliseconds.
 		ms := 50 + (rand.Int63() % 300)
 		time.Sleep(time.Duration(ms) * time.Millisecond)
+
+		// Your code here (3A)
+		// Check if a leader election should be started.
+		rf.mu.Lock()
+		if rf.state != StateLeader && time.Since(rf.lastElection) > ElectionTimeoutMax {
+			rf.mu.Unlock()
+			rf.startElection()
+		} else {
+			rf.mu.Unlock()
+		}
 	}
 }
 
@@ -224,6 +425,10 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (3A, 3B, 3C).
+	rf.state = StateFollower
+	rf.currentTerm = 0
+	rf.voteFor = -1
+	rf.lastElection = time.Now()
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
