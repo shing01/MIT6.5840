@@ -7,14 +7,14 @@ package raft
 // Make() creates a new raft peer that implements the raft interface.
 
 import (
-	//	"bytes"
+	"bytes" //Part 3C
 	"math/rand"
 	"sync"
 	"sync/atomic"
 	"time"
-	// "fmt"
+	"fmt"
 
-	//	"6.5840/labgob"
+	"6.5840/labgob" // Part 3C
 	"6.5840/labrpc"
 	"6.5840/raftapi"
 	"6.5840/tester1"
@@ -100,6 +100,13 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.voteFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
 }
 
 
@@ -121,6 +128,19 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var voteFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil || d.Decode(&voteFor) != nil || d.Decode(&log) != nil {
+		fmt.Printf("Error decoding persistent state\n")
+		return
+	} else {
+		rf.currentTerm = currentTerm
+		rf.voteFor = voteFor
+		rf.log = log
+	}
 }
 
 // how many bytes in Raft's persisted log?
@@ -175,6 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.state = StateFollower
 		rf.currentTerm = args.Term
 		rf.voteFor = -1
+		rf.persist()
 	}
 
 	reply.Term = rf.currentTerm
@@ -193,6 +214,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.VoteGranted = true
 		rf.voteFor = args.CandidateId
 		rf.lastElection = time.Now()
+		rf.persist()
 	} else {
 		reply.VoteGranted = false
 	}
@@ -208,8 +230,12 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term	int // current term, for leader to update itself
-	Success bool
+	Term		  int // current term, for leader to update itself
+	Success 	  bool
+
+	ConflictTerm  int // term in the conflicting entry (if any)
+	ConflictIndex int // index of first entry with that term (if any)
+	LogLen		  int // log length
 }
 
 // example AppendEntries RPC handler.
@@ -226,6 +252,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.voteFor = -1
 		rf.currentTerm = args.Term
+		rf.persist()
 	}
 
 	rf.state = StateFollower
@@ -233,10 +260,18 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	if args.PrevLogIndex >= len(rf.log) {
 		reply.Success = false
+		reply.ConflictTerm = -1
+		reply.ConflictIndex = len(rf.log)
 		return
 	}
 	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.Success = false
+		reply.ConflictTerm = rf.log[args.PrevLogIndex].Term
+		index := args.PrevLogIndex
+		for index > 0 && rf.log[index].Term == rf.log[args.PrevLogIndex].Term {
+			index--
+		}
+		reply.ConflictIndex = index
 		return
 	}
 
@@ -246,9 +281,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			if rf.log[index].Term != entry.Term {
 				rf.log = rf.log[:index]
 				rf.log = append(rf.log, entry)
+				rf.persist()
 			}
 		} else {
 			rf.log = append(rf.log, entry)
+			rf.persist()
 		}
 	}
 
@@ -333,6 +370,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	rf.log = append(rf.log, entry)
 	index = len(rf.log) - 1
 	term = rf.currentTerm
+	rf.persist()
 	// fmt.Printf("S%d Start command index %d term %d\n", rf.me, index, term)
 
 	return index, term, isLeader
@@ -409,6 +447,7 @@ func (rf *Raft) startElection() {
 				rf.state = StateFollower
 				rf.currentTerm = reply.Term
 				rf.voteFor = -1
+				rf.persist()
 				return
 			}
 
@@ -484,6 +523,7 @@ func (rf *Raft) sendHeartbeats() {
 					rf.state = StateFollower
 					rf.currentTerm = reply.Term
 					rf.voteFor = -1
+					rf.persist()
 					return
 				}
 
@@ -510,10 +550,23 @@ func (rf *Raft) sendHeartbeats() {
 						}
 					}
 				} else {
-					if rf.nextIndex[server] > 1 {
-						rf.nextIndex[server]--
+					if reply.ConflictTerm == -1 {
+						rf.nextIndex[server] = reply.ConflictIndex
+					} else {
+						lastIndexOfTerm := -1
+						for i := len(rf.log) - 1; i >= 0; i-- {
+							if rf.log[i].Term == reply.ConflictTerm {
+								lastIndexOfTerm = i
+								break
+							}
+						}
+
+						if lastIndexOfTerm != -1 {
+							rf.nextIndex[server] = lastIndexOfTerm + 1
+						} else {
+							rf.nextIndex[server] = reply.ConflictIndex
+						}
 					}
-					// rf.matchIndex[server] = rf.nextIndex[server] - 1 
 				}
 			}(server)
 		}
